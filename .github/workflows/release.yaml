@@ -2,28 +2,15 @@ name: Release
 
 on:
   push:
-    branches: [master]
-  release:
-    types: [published]
+    tags:
+      - "v*"
 
 permissions:
   contents: write
 
 jobs:
-  release-drafter:
-    name: Update Release Draft
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: release-drafter/release-drafter@v7
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   test:
     name: Test
-    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -39,14 +26,11 @@ jobs:
 
   validate:
     name: Validate
-    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     needs: [test]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.release.tag_name }}
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -61,3 +45,13 @@ jobs:
             echo "ERROR: go.mod/go.sum are not up-to-date."
             exit 1
           fi
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [validate]
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

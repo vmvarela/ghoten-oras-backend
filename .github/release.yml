@@ -1,0 +1,21 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+  categories:
+    - title: "🚀 Features"
+      labels:
+        - "type:feature"
+    - title: "🐛 Bug Fixes"
+      labels:
+        - "type:bug"
+    - title: "🧰 Maintenance"
+      labels:
+        - "type:chore"
+        - "tech-debt"
+    - title: "📝 Documentation"
+      labels:
+        - "type:docs"
+    - title: "Other Changes"
+      labels:
+        - "*"
