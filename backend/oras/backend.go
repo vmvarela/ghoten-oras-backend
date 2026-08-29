@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 
 	orasRemote "oras.land/oras-go/v2/registry/remote"
 	orasAuth "oras.land/oras-go/v2/registry/remote/auth"
@@ -66,10 +65,14 @@ func newORASRepositoryClient(ctx context.Context, cfg Config, logger *slog.Logge
 		httpClient: httpCl,
 	}
 
-	// Configure ORAS auth client on the remote repository.
+	// Configure ORAS auth client on the remote repository. The auth cache is
+	// required: without it, repeated manifest operations can request a new
+	// GHCR bearer token for every request, making init, plan, and bulk state
+	// operations appear frozen.
 	if cfg.CredentialFunc != nil {
 		repo.Client = &orasAuth.Client{
 			Client: httpCl,
+			Cache:  orasAuth.NewCache(),
 			Credential: func(ctx context.Context, host string) (orasAuth.Credential, error) {
 				cred, err := cfg.CredentialFunc(ctx, host)
 				if err != nil {
@@ -85,6 +88,7 @@ func newORASRepositoryClient(ctx context.Context, cfg Config, logger *slog.Logge
 	} else {
 		repo.Client = &orasAuth.Client{
 			Client: httpCl,
+			Cache:  orasAuth.NewCache(),
 		}
 	}
 
@@ -141,21 +145,39 @@ func (b *ORASBackend) DeleteWorkspace(ctx context.Context, name string, _ bool) 
 	stateRef := stateTagPrefix + wsTag
 	lockRef := lockTagPrefix + wsTag
 	unlockedRef := unlockedTagPrefix + wsTag
-	stateVersionPrefix := stateRef + stateVersionTagSeparator
+	stateVersionBase := stateVersionTagPrefix + wsTag
 
 	// Delete the main state manifest.
 	if err := resolveAndDelete(ctx, b.repoClient, stateRef); err != nil {
 		return fmt.Errorf("deleting state for workspace %q: %w", name, err)
 	}
 
-	// Delete versioned state manifests.
+	// Delete versioned state manifests. New-format stver- tags are safe to
+	// delete by exact version prefix. Legacy state-<workspace>-v<N> tags are
+	// ambiguous with live workspaces whose names end in -v<N>, so delete them
+	// only when the manifest annotation confirms ownership.
 	if err := b.repoClient.inner.Tags(ctx, "", func(page []string) error {
 		for _, tag := range page {
-			if !strings.HasPrefix(tag, stateVersionPrefix) {
+			if _, ok := parseVersionTagForBase(tag, stateVersionBase); ok {
+				if err := resolveAndDelete(ctx, b.repoClient, tag); err != nil {
+					return fmt.Errorf("deleting state version %q for workspace %q: %w", tag, name, err)
+				}
+				continue
+			}
+
+			v, ok := parseLegacyVersionTagForStateTag(tag, stateRef)
+			if !ok {
+				continue
+			}
+			matches, err := stateVersionTagMatchesWorkspace(ctx, b.repoClient, tag, name, v)
+			if err != nil {
+				return fmt.Errorf("checking legacy state version %q for workspace %q: %w", tag, name, err)
+			}
+			if !matches {
 				continue
 			}
 			if err := resolveAndDelete(ctx, b.repoClient, tag); err != nil {
-				return fmt.Errorf("deleting state version %q for workspace %q: %w", tag, name, err)
+				return fmt.Errorf("deleting legacy state version %q for workspace %q: %w", tag, name, err)
 			}
 		}
 		return nil

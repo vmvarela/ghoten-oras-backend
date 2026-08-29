@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,9 @@ import (
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	oras "oras.land/oras-go/v2"
+	orasRemote "oras.land/oras-go/v2/registry/remote"
+	orasAuth "oras.land/oras-go/v2/registry/remote/auth"
 	orasErrcode "oras.land/oras-go/v2/registry/remote/errcode"
 )
 
@@ -1836,5 +1840,177 @@ func TestGroupVersionsByDigest_skipsCurrentDigest(t *testing.T) {
 		t.Error("expected group for otherDigest")
 	} else if len(g.tags) != 1 || g.tags[0] != client.versionTagFor(3) {
 		t.Errorf("expected group to contain v3 tag only, got %v", g.tags)
+	}
+}
+
+// manifestCountingRepo counts Resolve and Fetch calls to assert bounded
+// manifest reads during workspace listing.
+type manifestCountingRepo struct {
+	delegatingRepo
+	mu       sync.Mutex
+	resolves int
+	fetches  int
+}
+
+func (r *manifestCountingRepo) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
+	r.mu.Lock()
+	r.resolves++
+	r.mu.Unlock()
+	return r.delegatingRepo.Resolve(ctx, reference)
+}
+
+func (r *manifestCountingRepo) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
+	r.mu.Lock()
+	r.fetches++
+	r.mu.Unlock()
+	return r.delegatingRepo.Fetch(ctx, target)
+}
+
+func (r *manifestCountingRepo) counts() (resolves int, fetches int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.resolves, r.fetches
+}
+
+func TestNewORASRepositoryClient_ConfiguresAuthCache(t *testing.T) {
+	cfg := Config{
+		Repository: "example.com/org/state",
+		CredentialFunc: func(context.Context, string) (Credential, error) {
+			return Credential{Username: "user", Password: "pass"}, nil
+		},
+	}
+	client, err := newORASRepositoryClient(context.Background(), cfg, slog.Default())
+	if err != nil {
+		t.Fatalf("newORASRepositoryClient: %v", err)
+	}
+
+	repo, ok := client.inner.(*orasRemote.Repository)
+	if !ok {
+		t.Fatalf("expected *remote.Repository, got %T", client.inner)
+	}
+	authClient, ok := repo.Client.(*orasAuth.Client)
+	if !ok {
+		t.Fatalf("expected *auth.Client, got %T", repo.Client)
+	}
+	if authClient.Cache == nil {
+		t.Fatal("expected ORAS auth cache to be configured")
+	}
+}
+
+func TestRemoteClient_WorkspacesFromTags_BoundsLegacyVersionManifestReads(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	setupRepo := &repositoryClient{inner: fake}
+
+	client := newClient(setupRepo, "app", nil)
+	if err := client.Put(ctx, []byte("state-app")); err != nil {
+		t.Fatalf("put app: %v", err)
+	}
+
+	for version := 1; version <= 100; version++ {
+		layerDesc, err := oras.PushBytes(ctx, setupRepo.inner, mediaTypeStateLayer, []byte(fmt.Sprintf("legacy-app-v%d", version)))
+		if err != nil {
+			t.Fatalf("push legacy layer v%d: %v", version, err)
+		}
+		manifestDesc, err := client.packStateManifest(ctx, []ocispec.Descriptor{layerDesc}, version)
+		if err != nil {
+			t.Fatalf("pack legacy manifest v%d: %v", version, err)
+		}
+		if err := setupRepo.inner.Tag(ctx, manifestDesc, client.stateTag+stateVersionTagSeparator+strconv.Itoa(version)); err != nil {
+			t.Fatalf("tag legacy version v%d: %v", version, err)
+		}
+	}
+
+	counting := &manifestCountingRepo{delegatingRepo: delegatingRepo{inner: fake}}
+	repo := &repositoryClient{inner: counting}
+	got, err := listWorkspacesFromTags(ctx, repo)
+	if err != nil {
+		t.Fatalf("list workspaces: %v", err)
+	}
+
+	if len(got) != 1 || got[0] != "app" {
+		t.Fatalf("expected only app workspace, got %v", got)
+	}
+
+	resolves, fetches := counting.counts()
+	if resolves > legacyVersionWorkspaceValidationLimitPerBase || fetches > legacyVersionWorkspaceValidationLimitPerBase {
+		t.Fatalf("expected at most %d legacy manifest reads, got resolves=%d fetches=%d", legacyVersionWorkspaceValidationLimitPerBase, resolves, fetches)
+	}
+}
+
+func TestRemoteClient_CurrentStateVersionIgnoresSiblingWorkspaceVersionSuffix(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	repo := &repositoryClient{inner: fake}
+
+	client := newClient(repo, "app", nil)
+	if err := client.Put(ctx, []byte("state-app")); err != nil {
+		t.Fatalf("put app: %v", err)
+	}
+
+	sibling := newClient(repo, "app-v2", nil)
+	if err := sibling.Put(ctx, []byte("state-app-v2")); err != nil {
+		t.Fatalf("put app-v2: %v", err)
+	}
+
+	if got := client.currentStateVersion(ctx); got != 0 {
+		t.Fatalf("expected sibling workspace app-v2 not to count as app legacy version, got %d", got)
+	}
+
+	existing, err := client.listExistingVersions(ctx)
+	if err != nil {
+		t.Fatalf("listExistingVersions: %v", err)
+	}
+	if len(existing) != 0 {
+		t.Fatalf("expected no new-format versions for app, got %v", existing)
+	}
+}
+
+func TestRemoteClient_CurrentStateVersionFallsBackToLegacyTagsWithoutAnnotation(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	repo := &repositoryClient{inner: fake}
+	client := newClient(repo, "app", nil)
+	client.versioningMaxVersions = 10
+
+	pushLegacyVersionWithoutStateAnnotation := func(version int) ocispec.Descriptor {
+		t.Helper()
+
+		layerDesc, err := oras.PushBytes(ctx, repo.inner, mediaTypeStateLayer, []byte(fmt.Sprintf("legacy-v%d", version)))
+		if err != nil {
+			t.Fatalf("push legacy layer v%d: %v", version, err)
+		}
+		manifestDesc, err := oras.PackManifest(ctx, repo.inner, oras.PackManifestVersion1_1, artifactTypeState, oras.PackManifestOptions{
+			Layers: []ocispec.Descriptor{layerDesc},
+			ManifestAnnotations: map[string]string{
+				annotationWorkspace: client.workspaceName,
+				annotationUpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			},
+		})
+		if err != nil {
+			t.Fatalf("pack legacy manifest v%d: %v", version, err)
+		}
+		legacyTag := client.stateTag + stateVersionTagSeparator + strconv.Itoa(version)
+		if err := repo.inner.Tag(ctx, manifestDesc, legacyTag); err != nil {
+			t.Fatalf("tag legacy version %q: %v", legacyTag, err)
+		}
+		return manifestDesc
+	}
+
+	pushLegacyVersionWithoutStateAnnotation(1)
+	legacyV2Desc := pushLegacyVersionWithoutStateAnnotation(2)
+	if err := repo.inner.Tag(ctx, legacyV2Desc, client.stateTag); err != nil {
+		t.Fatalf("tag current legacy state: %v", err)
+	}
+
+	if got := client.currentStateVersion(ctx); got != 2 {
+		t.Fatalf("expected fallback legacy current version 2, got %d", got)
+	}
+	if err := client.Put(ctx, []byte("new-state-v3")); err != nil {
+		t.Fatalf("put migrated state: %v", err)
+	}
+	client.WaitForRetention()
+	if _, err := fake.Resolve(ctx, client.versionTagFor(3)); err != nil {
+		t.Fatalf("expected migrated stver v3 tag to exist: %v", err)
 	}
 }

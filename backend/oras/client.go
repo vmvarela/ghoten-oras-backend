@@ -83,6 +83,7 @@ var minimalGzipStream = func() []byte {
 
 // Tag naming scheme:
 //   - State is stored at "state-<workspaceTag>".
+//   - State versions are stored at "stver-<workspaceTag>-v<N>".
 //   - Lock is stored at "locked-<workspaceTag>".
 //   - On registries that don't support manifest deletion (GHCR returns 405),
 //     unlock retags to "unlocked-<workspaceTag>" instead.
@@ -93,7 +94,15 @@ const (
 	stateTagPrefix           = "state-"
 	lockTagPrefix            = "locked-"
 	unlockedTagPrefix        = "unlocked-"
+	stateVersionTagPrefix    = "stver-"
 	stateVersionTagSeparator = "-v"
+
+	// Legacy state version tags share the state-<workspace>-v<N> namespace with
+	// tag-safe workspaces whose names end in -v<N>. Validating every ambiguous
+	// tag requires a manifest fetch and can turn workspace listing into hundreds
+	// of registry requests for repositories with long legacy histories. Keep a
+	// small exact-validation budget and assume the rest are legacy versions.
+	legacyVersionWorkspaceValidationLimitPerBase = 16
 )
 
 // LockManifestData holds metadata about a lock that helps detect stale locks
@@ -116,6 +125,7 @@ type Client struct {
 	repo             *repositoryClient
 	workspaceName    string
 	stateTag         string
+	versionTagBase   string
 	lockTag          string
 	unlockedTag      string
 	retryConfig      RetryConfig
@@ -173,6 +183,7 @@ func newClient(repo *repositoryClient, workspaceName string, logger *slog.Logger
 		repo:                  repo,
 		workspaceName:         workspaceName,
 		stateTag:              stateTagPrefix + wsTag,
+		versionTagBase:        stateVersionTagPrefix + wsTag,
 		lockTag:               lockTagPrefix + wsTag,
 		unlockedTag:           unlockedTagPrefix + wsTag,
 		retryConfig:           DefaultRetryConfig(),
@@ -387,13 +398,13 @@ func (c *Client) put(ctx context.Context, state []byte) error {
 }
 
 func (c *Client) versionTagFor(version int) string {
-	return fmt.Sprintf("%s%s%d", c.stateTag, stateVersionTagSeparator, version)
+	return fmt.Sprintf("%s%s%d", c.versionTagBase, stateVersionTagSeparator, version)
 }
 
 // currentStateVersion reads the version number from the current state manifest's
-// annotation. Returns 0 if no manifest exists or if the annotation is absent
-// (backward compat with pre-annotation manifests). Falls back to a full tag
-// scan only when the manifest exists but has no version annotation.
+// annotation. Returns 0 if no manifest exists, or if the backward-compatible
+// tag scan finds no versions. Falls back to a full tag scan only when the
+// manifest exists but has no version annotation.
 func (c *Client) currentStateVersion(ctx context.Context) int {
 	fm, err := c.fetchManifestWithDesc(ctx, c.stateTag)
 	if err != nil {
@@ -408,8 +419,18 @@ func (c *Client) currentStateVersion(ctx context.Context) int {
 	}
 	// Backward compat: manifest exists but has no version annotation.
 	// Fall back to scanning tags (only happens once per manifest upgrade).
+	// Legacy state-<workspace>-v<N> tags are handled separately from
+	// new-format stver- tags, with exact manifest validation.
 	existing, listErr := c.listExistingVersions(ctx)
-	if listErr != nil || len(existing) == 0 {
+	if listErr != nil {
+		return 0
+	}
+	legacyExisting, listErr := c.listLegacyExistingVersions(ctx)
+	if listErr != nil {
+		return 0
+	}
+	existing = append(existing, legacyExisting...)
+	if len(existing) == 0 {
 		return 0
 	}
 	max := 0
@@ -421,8 +442,11 @@ func (c *Client) currentStateVersion(ctx context.Context) int {
 	return max
 }
 
-// listExistingVersions scans all tags and returns the version numbers that
-// match the state-<workspace>-v<N> pattern for this client's workspace.
+// listExistingVersions scans all tags and returns the new-format stver version
+// numbers that match this client's workspace. Legacy state-<workspace>-v<N>
+// tags are intentionally excluded here: retention does not prune them, and the
+// current-version migration fallback handles them separately with exact manifest
+// validation.
 func (c *Client) listExistingVersions(ctx context.Context) ([]int, error) {
 	var tags []string
 	if err := c.repo.inner.Tags(ctx, "", func(page []string) error {
@@ -434,11 +458,40 @@ func (c *Client) listExistingVersions(ctx context.Context) ([]int, error) {
 
 	var existing []int
 	for _, t := range tags {
-		base, v, ok := splitStateVersionTag(t)
-		if !ok || base != c.stateTag {
+		if v, ok := parseVersionTagForBase(t, c.versionTagBase); ok {
+			existing = append(existing, v)
+		}
+	}
+	return existing, nil
+}
+
+// listLegacyExistingVersions scans legacy state-<workspace>-v<N> tags for the
+// one-time current-version fallback used by pre-annotation state manifests.
+// Legacy tags are ambiguous with tag-safe workspaces whose names end in -v<N>,
+// so this rare migration path validates ownership by reading manifest
+// annotations instead of accepting tag names alone.
+func (c *Client) listLegacyExistingVersions(ctx context.Context) ([]int, error) {
+	var tags []string
+	if err := c.repo.inner.Tags(ctx, "", func(page []string) error {
+		tags = append(tags, page...)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	var existing []int
+	for _, t := range tags {
+		v, ok := parseLegacyVersionTagForStateTag(t, c.stateTag)
+		if !ok {
 			continue
 		}
-		existing = append(existing, v)
+		matches, err := stateVersionTagMatchesWorkspace(ctx, c.repo, t, c.workspaceName, v)
+		if err != nil {
+			return nil, err
+		}
+		if matches {
+			existing = append(existing, v)
+		}
 	}
 	return existing, nil
 }
@@ -947,20 +1000,57 @@ func listWorkspacesFromTags(ctx context.Context, repo *repositoryClient) ([]stri
 		tagSet[t] = struct{}{}
 	}
 
+	type legacyVersionCandidate struct {
+		tag     string
+		base    string
+		version int
+	}
+
 	var relevantTags []string
+	ambiguousByBase := make(map[string][]legacyVersionCandidate)
 	for _, tag := range tags {
 		if !strings.HasPrefix(tag, stateTagPrefix) {
 			continue
 		}
-		if base, _, ok := splitStateVersionTag(tag); ok {
+
+		if base, version, ok := splitStateVersionTag(tag); ok {
 			if _, ok := tagSet[base]; ok {
+				ambiguousByBase[base] = append(ambiguousByBase[base], legacyVersionCandidate{
+					tag:     tag,
+					base:    base,
+					version: version,
+				})
 				continue
 			}
 		}
+
 		relevantTags = append(relevantTags, tag)
 	}
 
-	// Process tags in parallel to resolve hashed names faster
+	var validateLegacyTags []legacyVersionCandidate
+	for _, candidates := range ambiguousByBase {
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].version == candidates[j].version {
+				return candidates[i].tag < candidates[j].tag
+			}
+			return candidates[i].version < candidates[j].version
+		})
+
+		if len(candidates) <= legacyVersionWorkspaceValidationLimitPerBase {
+			validateLegacyTags = append(validateLegacyTags, candidates...)
+			continue
+		}
+
+		lowCount := legacyVersionWorkspaceValidationLimitPerBase / 2
+		highCount := legacyVersionWorkspaceValidationLimitPerBase - lowCount
+		validateLegacyTags = append(validateLegacyTags, candidates[:lowCount]...)
+		validateLegacyTags = append(validateLegacyTags, candidates[len(candidates)-highCount:]...)
+	}
+
+	// Process tags in parallel. Tag-safe workspace names are resolved purely
+	// from tag names, matching other backends that list state keys directly.
+	// Only hashed workspace names and a bounded sample of ambiguous legacy
+	// state-<workspace>-v<N> version tags require reading manifest annotations.
 	var mu sync.Mutex
 	var out []string
 	g, ctx := errgroup.WithContext(ctx)
@@ -969,6 +1059,28 @@ func listWorkspacesFromTags(ctx context.Context, repo *repositoryClient) ([]stri
 	for _, tag := range relevantTags {
 		g.Go(func() error {
 			name, err := workspaceNameFromTag(ctx, repo, tag)
+			if err != nil {
+				return err
+			}
+			if name != "" {
+				mu.Lock()
+				out = append(out, name)
+				mu.Unlock()
+			}
+			return nil
+		})
+	}
+	for _, candidate := range validateLegacyTags {
+		g.Go(func() error {
+			isLegacyVersion, err := stateVersionTagMatchesStateTag(ctx, repo, candidate.tag, candidate.base, candidate.version)
+			if err != nil {
+				return err
+			}
+			if isLegacyVersion {
+				return nil
+			}
+
+			name, err := workspaceNameFromTag(ctx, repo, candidate.tag)
 			if err != nil {
 				return err
 			}
@@ -1015,6 +1127,83 @@ func splitStateVersionTag(tag string) (base string, version int, ok bool) {
 		return "", 0, false
 	}
 	return base, v, true
+}
+
+func parseVersionTagForBase(tag string, versionTagBase string) (version int, ok bool) {
+	if versionTagBase == "" {
+		return 0, false
+	}
+	prefix := versionTagBase + stateVersionTagSeparator
+	if !strings.HasPrefix(tag, prefix) {
+		return 0, false
+	}
+	return parsePositiveVersion(tag[len(prefix):])
+}
+
+func parseLegacyVersionTagForStateTag(tag string, stateTag string) (version int, ok bool) {
+	return parseVersionTagForBase(tag, stateTag)
+}
+
+func parsePositiveVersion(s string) (version int, ok bool) {
+	v, err := strconv.Atoi(s)
+	if err != nil || v <= 0 || v > 1<<30 {
+		return 0, false
+	}
+	return v, true
+}
+
+func stateVersionTagMatchesWorkspace(ctx context.Context, repo *repositoryClient, tag string, workspaceName string, expectedVersion int) (bool, error) {
+	return stateVersionTagMatchesStateTag(ctx, repo, tag, stateTagPrefix+workspaceTagFor(workspaceName), expectedVersion)
+}
+
+func stateVersionTagMatchesStateTag(ctx context.Context, repo *repositoryClient, tag string, expectedStateTag string, expectedVersion int) (bool, error) {
+	m, err := fetchManifest(ctx, repo, tag)
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if m.ArtifactType != "" && m.ArtifactType != artifactTypeState {
+		return false, nil
+	}
+	workspaceName := m.Annotations[annotationWorkspace]
+	if workspaceName == "" || stateTagPrefix+workspaceTagFor(workspaceName) != expectedStateTag {
+		return false, nil
+	}
+	if raw := m.Annotations[annotationStateVersion]; raw != "" {
+		v, ok := parsePositiveVersion(raw)
+		if !ok || v != expectedVersion {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func fetchManifest(ctx context.Context, repo *repositoryClient, reference string) (*manifest, error) {
+	desc, err := repo.inner.Resolve(ctx, reference)
+	if err != nil {
+		return nil, err
+	}
+	rc, err := repo.inner.Fetch(ctx, desc)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, err
+	}
+
+	var m manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("decoding manifest %q: %w", reference, err)
+	}
+	if m.Annotations == nil {
+		m.Annotations = map[string]string{}
+	}
+	return &m, nil
 }
 
 func workspaceNameFromTag(ctx context.Context, repo *repositoryClient, stateTag string) (string, error) {
