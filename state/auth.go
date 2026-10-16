@@ -55,7 +55,10 @@ func BuildHTTPClient(skipVerify bool, caFile string) (*http.Client, error) {
 var Version = "dev"
 
 // userAgent returns the User-Agent string for HTTP requests.
-func userAgent() string {
+func userAgent(configured string) string {
+	if configured != "" {
+		return configured
+	}
 	return "oras-state/" + Version
 }
 
@@ -75,11 +78,27 @@ const (
 	WorkspaceLayoutLegacyGhoten
 )
 
+// Credential is a registry credential returned by a caller-supplied resolver.
+type Credential struct {
+	Username    string
+	Password    string
+	AccessToken string
+}
+
+// CredentialFunc resolves credentials for a registry host.
+type CredentialFunc func(ctx context.Context, hostport string) (Credential, error)
+
 // Config holds all configurable options for the ORAS client.
 type Config struct {
 	// WorkspaceLayout selects the OCI tag layout. The zero value is the
 	// strict SHA-256 layout used by terraform-provider-oras.
 	WorkspaceLayout WorkspaceLayout
+
+	// CredentialFunc optionally delegates credential resolution to the caller.
+	// When set it takes precedence over built-in token/env/config discovery.
+	CredentialFunc CredentialFunc
+	// UserAgent overrides the default oras-state/<version> User-Agent.
+	UserAgent string
 
 	// PlainHTTP explicitly selects HTTP instead of HTTPS.
 	PlainHTTP bool
@@ -207,7 +226,7 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 		}
 		httpClient.Transport = &userAgentRoundTripper{
 			next:      next,
-			userAgent: userAgent(),
+			userAgent: userAgent(cfg.UserAgent),
 		}
 	}
 
@@ -280,6 +299,21 @@ func resolveCredentials(registry, repository string, cfg Config) (orasAuth.Crede
 	// Normalize the host so case variants ("GHCR.IO") and Docker-style keys
 	// ("https://ghcr.io/v1/") match the GHCR-specific paths below.
 	registry = normalizeRegistryHost(registry)
+
+	// Priority 0: caller-supplied resolver (used by OpenTofu integration).
+	if cfg.CredentialFunc != nil {
+		return func(ctx context.Context, hostport string) (orasAuth.Credential, error) {
+			cred, err := cfg.CredentialFunc(ctx, hostport)
+			if err != nil {
+				return orasAuth.EmptyCredential, err
+			}
+			return orasAuth.Credential{
+				Username:    cred.Username,
+				Password:    cred.Password,
+				AccessToken: cred.AccessToken,
+			}, nil
+		}, "", orasAuth.EmptyCredential
+	}
 
 	// Priority 1: Explicit token
 	if cfg.Token != "" {
