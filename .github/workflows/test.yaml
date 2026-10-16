@@ -39,10 +39,21 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Tidy modules
+        run: go mod tidy
+
+      - name: Upload tidied module files
+        uses: actions/upload-artifact@v6
+        with:
+          name: tidied-modules
+          path: |
+            go.mod
+            go.sum
+
       - name: Check go.mod tidiness
         run: |
-          go mod tidy
           if [[ -n "$(git status --porcelain go.mod go.sum)" ]]; then
+            git diff -- go.mod go.sum
             echo "ERROR: go.mod/go.sum are not up-to-date. Run 'go mod tidy' and commit."
             exit 1
           fi
