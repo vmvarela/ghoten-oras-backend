@@ -44,9 +44,17 @@ func (c *Client) Get(ctx context.Context) (*StatePayload, error) {
 }
 
 func (c *Client) Put(ctx context.Context, data []byte) error {
-	return withRetryNoResult(ctx, c.retryConfig, func(ctx context.Context) error {
+	if err := withRetryNoResult(ctx, c.retryConfig, func(ctx context.Context) error {
 		return c.client.Put(ctx, c.workspaceName, data)
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Keep asynchronous retention inside the reusable engine, but make the
+	// OpenTofu adapter synchronous at its boundary. This avoids leaking a
+	// backend-specific "wait for retention" capability into OpenTofu Core.
+	c.client.WaitForRetention()
+	return nil
 }
 
 func (c *Client) Delete(ctx context.Context) error {
