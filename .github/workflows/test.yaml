@@ -60,3 +60,44 @@ jobs:
 
       - name: Run go vet
         run: go vet ./...
+
+  zot-integration:
+    name: Integration Test (Zot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run Zot integration tests
+        env:
+          TF_ORAS_ZOT_TEST: "1"
+        run: go test -race -v -timeout 120s ./state/... -run Zot
+
+  ghcr-integration:
+    name: Integration Test (GHCR)
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run GHCR integration tests
+        env:
+          TF_ORAS_GHCR_TEST: "1"
+          TF_ORAS_GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: go test -race -v -timeout 300s ./state/... -run 'TestGHCRIntegration'

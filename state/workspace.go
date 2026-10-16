@@ -99,6 +99,10 @@ func validateWorkspaceManifest(m ocispec.Manifest, tag, workspace string) error 
 // closes the existing verify-to-write window. Never cache its registry result.
 // Scoped per ADR-0002 Amendment 1: names repo-wide, annotations only for own mutable tags.
 func (wc *workspaceClient) checkWorkspace(ctx context.Context) error {
+	if wc.client.config.WorkspaceLayout == WorkspaceLayoutLegacyGhoten {
+		return wc.checkLegacyGhotenWorkspace(ctx)
+	}
+
 	for _, tag := range []string{wc.stateTag, wc.lockTag, wc.unlockedTag, wc.versionTagFor(maxStateVersion)} {
 		if err := (orasRegistry.Reference{Reference: tag}).ValidateReferenceAsTag(); err != nil {
 			return fmt.Errorf("invalid workspace tag: %w", err)
