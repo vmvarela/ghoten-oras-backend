@@ -59,8 +59,28 @@ func userAgent() string {
 	return "oras-state/" + Version
 }
 
+
+// WorkspaceLayout controls how logical state/workspace names map to OCI tags.
+type WorkspaceLayout uint8
+
+const (
+	// WorkspaceLayoutHashed is the default, collision-resistant layout used by
+	// terraform-provider-oras. Every workspace name maps to its full SHA-256.
+	WorkspaceLayoutHashed WorkspaceLayout = iota
+
+	// WorkspaceLayoutLegacyGhoten preserves the tag layout used by Ghoten
+	// 1.13.0 and earlier: valid OCI tag names remain literal, while invalid
+	// names use a short "ws-" hash fallback. Use this only for compatibility
+	// with existing Ghoten repositories.
+	WorkspaceLayoutLegacyGhoten
+)
+
 // Config holds all configurable options for the ORAS client.
 type Config struct {
+	// WorkspaceLayout selects the OCI tag layout. The zero value is the
+	// strict SHA-256 layout used by terraform-provider-oras.
+	WorkspaceLayout WorkspaceLayout
+
 	// PlainHTTP explicitly selects HTTP instead of HTTPS.
 	PlainHTTP bool
 	// TLSSkipVerify disables HTTPS certificate verification without selecting HTTP.
