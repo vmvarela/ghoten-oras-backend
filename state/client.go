@@ -193,7 +193,7 @@ type workspaceClient struct {
 
 // newWorkspaceClient creates a workspaceClient for the given stateID (workspace name).
 func newWorkspaceClient(c *Client, stateID string) *workspaceClient {
-	wsTag := workspaceTagFor(stateID)
+	wsTag := c.workspaceTagFor(stateID)
 	return &workspaceClient{
 		client:         c,
 		stateID:        stateID,
@@ -934,6 +934,11 @@ func (wc *workspaceClient) unlock(ctx context.Context, id string) error {
 func (c *Client) List(ctx context.Context) ([]string, error) {
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
+	if c.config.WorkspaceLayout == WorkspaceLayoutLegacyGhoten {
+		return retryWithResult(ctx, func(ctx context.Context) ([]string, error) {
+			return listLegacyGhotenWorkspaces(ctx, c.repoClient)
+		})
+	}
 	return retryWithResult(ctx, func(ctx context.Context) ([]string, error) {
 		return listWorkspacesFromTags(ctx, c.repoClient)
 	})
@@ -1421,6 +1426,13 @@ func parseLockManifestData(m *ocispec.Manifest) (*lockManifestData, error) {
 func workspaceTagFor(workspace string) string {
 	h := sha256.Sum256([]byte(workspace))
 	return hex.EncodeToString(h[:])
+}
+
+func (c *Client) workspaceTagFor(workspace string) string {
+	if c.config.WorkspaceLayout == WorkspaceLayoutLegacyGhoten {
+		return legacyGhotenWorkspaceTagFor(workspace)
+	}
+	return workspaceTagFor(workspace)
 }
 
 // listWorkspacesFromTags discovers workspace names by scanning the repository's
