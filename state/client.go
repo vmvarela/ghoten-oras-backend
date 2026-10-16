@@ -939,8 +939,16 @@ func (c *Client) List(ctx context.Context) ([]string, error) {
 	})
 }
 
+// Close waits for all in-flight background retention work to finish.
+// It is safe to call multiple times. Consumers should prefer Close over
+// depending on retention implementation details.
+func (c *Client) Close() error {
+	c.retentionWg.Wait()
+	return nil
+}
+
 // WaitForRetention blocks until all in-flight async retention goroutines complete.
-// Call this before process exit when versioning is enabled.
+// Deprecated: use Close for lifecycle management. Kept for compatibility and tests.
 func (c *Client) WaitForRetention() {
 	c.retentionWg.Wait()
 }
