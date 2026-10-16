@@ -1,6 +1,6 @@
 module github.com/vmvarela/ghoten-oras-backend
 
-go 1.25.0
+go 1.26.9
 
 require (
 	github.com/hashicorp/go-cleanhttp v0.5.2
