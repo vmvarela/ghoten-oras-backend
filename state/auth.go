@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,7 +56,10 @@ func BuildHTTPClient(skipVerify bool, caFile string) (*http.Client, error) {
 var Version = "dev"
 
 // userAgent returns the User-Agent string for HTTP requests.
-func userAgent() string {
+func userAgent(configured ...string) string {
+	if len(configured) > 0 && configured[0] != "" {
+		return configured[0]
+	}
 	return "oras-state/" + Version
 }
 
@@ -75,11 +79,27 @@ const (
 	WorkspaceLayoutLegacyGhoten
 )
 
+// Credential is a registry credential returned by a caller-supplied resolver.
+type Credential struct {
+	Username    string
+	Password    string
+	AccessToken string
+}
+
+// CredentialFunc resolves credentials for a registry host.
+type CredentialFunc func(ctx context.Context, hostport string) (Credential, error)
+
 // Config holds all configurable options for the ORAS client.
 type Config struct {
 	// WorkspaceLayout selects the OCI tag layout. The zero value is the
 	// strict SHA-256 layout used by terraform-provider-oras.
 	WorkspaceLayout WorkspaceLayout
+
+	// CredentialFunc optionally delegates credential resolution to the caller.
+	// When set it takes precedence over built-in token/env/config discovery.
+	CredentialFunc CredentialFunc
+	// UserAgent overrides the default oras-state/<version> User-Agent.
+	UserAgent string
 
 	// PlainHTTP explicitly selects HTTP instead of HTTPS.
 	PlainHTTP bool
@@ -134,6 +154,7 @@ type orasRepositoryClient struct {
 	inner        orasRepository
 	token        string              // access token (for GHCR API calls)
 	resolvedCred orasAuth.Credential // resolved credential, whatever path produced it
+	credentialFn orasAuth.CredentialFunc
 	httpClient   *http.Client
 }
 
@@ -148,7 +169,20 @@ func (r *orasRepositoryClient) accessToken(_ context.Context) (string, error) {
 	if r.resolvedCred.AccessToken != "" {
 		return r.resolvedCred.AccessToken, nil
 	}
-	return r.resolvedCred.Password, nil
+	if r.resolvedCred.Password != "" {
+		return r.resolvedCred.Password, nil
+	}
+	if r.credentialFn != nil {
+		cred, err := r.credentialFn(context.Background(), normalizeRegistryHost(strings.SplitN(r.repository, "/", 2)[0]))
+		if err != nil {
+			return "", err
+		}
+		if cred.AccessToken != "" {
+			return cred.AccessToken, nil
+		}
+		return cred.Password, nil
+	}
+	return "", nil
 }
 
 // NewClient creates an ORAS client for the given registry and repository.
@@ -207,7 +241,7 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 		}
 		httpClient.Transport = &userAgentRoundTripper{
 			next:      next,
-			userAgent: userAgent(),
+			userAgent: userAgent(cfg.UserAgent),
 		}
 	}
 
@@ -229,6 +263,7 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 		inner:        repo,
 		token:        resolvedToken,
 		resolvedCred: resolvedCred,
+		credentialFn: cred,
 		httpClient:   httpClient,
 	}, nil
 }
@@ -280,6 +315,21 @@ func resolveCredentials(registry, repository string, cfg Config) (orasAuth.Crede
 	// Normalize the host so case variants ("GHCR.IO") and Docker-style keys
 	// ("https://ghcr.io/v1/") match the GHCR-specific paths below.
 	registry = normalizeRegistryHost(registry)
+
+	// Priority 0: caller-supplied resolver (used by OpenTofu integration).
+	if cfg.CredentialFunc != nil {
+		return func(ctx context.Context, hostport string) (orasAuth.Credential, error) {
+			cred, err := cfg.CredentialFunc(ctx, hostport)
+			if err != nil {
+				return orasAuth.EmptyCredential, err
+			}
+			return orasAuth.Credential{
+				Username:    cred.Username,
+				Password:    cred.Password,
+				AccessToken: cred.AccessToken,
+			}, nil
+		}, "", orasAuth.EmptyCredential
+	}
 
 	// Priority 1: Explicit token
 	if cfg.Token != "" {
