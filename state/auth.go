@@ -153,6 +153,7 @@ type orasRepositoryClient struct {
 	inner        orasRepository
 	token        string              // access token (for GHCR API calls)
 	resolvedCred orasAuth.Credential // resolved credential, whatever path produced it
+	credentialFn orasAuth.CredentialFunc
 	httpClient   *http.Client
 }
 
@@ -167,7 +168,20 @@ func (r *orasRepositoryClient) accessToken(_ context.Context) (string, error) {
 	if r.resolvedCred.AccessToken != "" {
 		return r.resolvedCred.AccessToken, nil
 	}
-	return r.resolvedCred.Password, nil
+	if r.resolvedCred.Password != "" {
+		return r.resolvedCred.Password, nil
+	}
+	if r.credentialFn != nil {
+		cred, err := r.credentialFn(context.Background(), normalizeRegistryHost(strings.SplitN(r.repository, "/", 2)[0]))
+		if err != nil {
+			return "", err
+		}
+		if cred.AccessToken != "" {
+			return cred.AccessToken, nil
+		}
+		return cred.Password, nil
+	}
+	return "", nil
 }
 
 // NewClient creates an ORAS client for the given registry and repository.
@@ -248,6 +262,7 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 		inner:        repo,
 		token:        resolvedToken,
 		resolvedCred: resolvedCred,
+		credentialFn: cred,
 		httpClient:   httpClient,
 	}, nil
 }
