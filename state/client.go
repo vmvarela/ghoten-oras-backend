@@ -1429,7 +1429,9 @@ func workspaceTagFor(workspace string) string {
 }
 
 func (c *Client) workspaceTagFor(workspace string) string {
-	if c.config.WorkspaceLayout == WorkspaceLayoutLegacyGhoten {
+	// A nil client is used by a few pure tag-mapping tests. Treat it as the
+	// zero-value configuration, which is the strict hashed layout.
+	if c != nil && c.config.WorkspaceLayout == WorkspaceLayoutLegacyGhoten {
 		return legacyGhotenWorkspaceTagFor(workspace)
 	}
 	return workspaceTagFor(workspace)
