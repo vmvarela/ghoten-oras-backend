@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,9 +56,9 @@ func BuildHTTPClient(skipVerify bool, caFile string) (*http.Client, error) {
 var Version = "dev"
 
 // userAgent returns the User-Agent string for HTTP requests.
-func userAgent(configured string) string {
-	if configured != "" {
-		return configured
+func userAgent(configured ...string) string {
+	if len(configured) > 0 && configured[0] != "" {
+		return configured[0]
 	}
 	return "oras-state/" + Version
 }
