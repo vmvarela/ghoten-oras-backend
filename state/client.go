@@ -478,6 +478,70 @@ func (wc *workspaceClient) delete(ctx context.Context) error {
 	return wc.deleteDigestWithFallback(ctx, desc, wc.stateTag)
 }
 
+// DeleteWorkspace removes state, locks, unlocked markers, and retained state
+// versions for one logical workspace. It is the operation backend adapters
+// should use when implementing workspace deletion.
+func (c *Client) DeleteWorkspace(ctx context.Context, stateID string) error {
+	ctx, cancel := c.opContext(ctx)
+	defer cancel()
+
+	wc := newWorkspaceClient(c, stateID)
+	if err := wc.checkWorkspace(ctx); err != nil {
+		return err
+	}
+
+	var tags []string
+	err := retry(ctx, func(ctx context.Context) error {
+		tags = tags[:0]
+		return c.repoClient.inner.Tags(ctx, "", func(page []string) error {
+			tags = append(tags, page...)
+			return nil
+		})
+	})
+	if isNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	for _, tag := range tags {
+		owned := tag == wc.stateTag || tag == wc.lockTag || tag == wc.unlockedTag ||
+			strings.HasPrefix(tag, wc.versionTagBase+stateVersionTagSeparator)
+
+		// Ghoten versions before the stver-* layout stored history as
+		// state-<workspace>-v<N>. Those tags are ambiguous with valid
+		// workspace names, so only delete them after manifest ownership
+		// verification.
+		if !owned && c.config.WorkspaceLayout == WorkspaceLayoutLegacyGhoten &&
+			strings.HasPrefix(tag, wc.stateTag+stateVersionTagSeparator) {
+			manifest, fetchErr := fetchRawManifest(ctx, c.repoClient, tag)
+			if isNotFound(fetchErr) {
+				continue
+			}
+			if fetchErr != nil {
+				return fetchErr
+			}
+			owned = manifest.Annotations[annotationWorkspace] == stateID
+		}
+		if !owned {
+			continue
+		}
+
+		desc, resolveErr := c.repoClient.inner.Resolve(ctx, tag)
+		if isNotFound(resolveErr) {
+			continue
+		}
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if err := wc.deleteDigestWithFallback(ctx, desc, tag); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Lock acquires a lock for the given stateID. Returns the lock ID on success.
 func (c *Client) Lock(ctx context.Context, stateID string, info LockInfo) (string, error) {
 	ctx, cancel := c.opContext(ctx)
