@@ -44,6 +44,12 @@ jobs:
           go mod tidy
           if [[ -n "$(git status --porcelain go.mod go.sum)" ]]; then
             git diff -- go.mod go.sum
+            echo "----- BEGIN TIDIED GO.MOD -----"
+            cat go.mod
+            echo "----- END TIDIED GO.MOD -----"
+            echo "----- BEGIN TIDIED GO.SUM -----"
+            cat go.sum
+            echo "----- END TIDIED GO.SUM -----"
             echo "ERROR: go.mod/go.sum are not up-to-date. Run 'go mod tidy' and commit."
             exit 1
           fi
