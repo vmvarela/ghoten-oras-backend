@@ -246,10 +246,13 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 	}
 
 	// Resolve credentials with the following priority:
-	// 1. Explicit token
-	// 2. Explicit username/password
-	// 3. Environment variables
-	// 4. Terraform CLI config / Docker config files
+	// 1. Caller-supplied CredentialFunc
+	// 2. Explicit token
+	// 3. Explicit username/password
+	// 4. Environment variables
+	//
+	// Terraform/OpenTofu CLI config and Docker credential discovery belong to
+	// consumers and should be supplied through CredentialFunc.
 	cred, resolvedToken, resolvedCred := resolveCredentials(registry, repository, cfg)
 
 	repo.Client = &orasAuth.Client{
@@ -277,10 +280,7 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 //  4. For ghcr.io only:
 //     a. GHCR_TOKEN environment variable
 //     b. GITHUB_TOKEN environment variable
-//  5. Configured credentials (Terraform CLI config oci_credentials blocks,
-//     Docker/containers config files, Docker credential helpers) resolved by
-//     specificity via resolveConfiguredCredential
-//  6. Anonymous access (EmptyCredential)
+//  5. Anonymous access (EmptyCredential)
 //
 // Steps 1-2 are reachable only by direct Client construction (tests,
 // library use): the provider never populates these Config fields, so
@@ -360,13 +360,6 @@ func resolveCredentials(registry, repository string, cfg Config) (orasAuth.Crede
 			cred := tokenCredential(registry, t)
 			return orasAuth.StaticCredential(registry, cred), t, cred
 		}
-	}
-
-	// Priority 4: Configured credentials (Terraform CLI config, Docker config
-	// files, Docker credential helpers), matched by specificity against the
-	// registry domain and repository path.
-	if cred, ok := resolveConfiguredCredential(context.Background(), registry, repository); ok {
-		return orasAuth.StaticCredential(registry, cred), "", cred
 	}
 
 	// Fall back to anonymous access
