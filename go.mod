@@ -4,7 +4,6 @@ go 1.26.9
 
 require (
 	github.com/hashicorp/go-cleanhttp v0.5.2
-	github.com/hashicorp/hcl/v2 v2.25.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0
