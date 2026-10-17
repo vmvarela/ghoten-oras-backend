@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> This repository is superseded by [vmvarela/oras-state](https://github.com/vmvarela/oras-state).
+> New development and shared OCI state semantics live there. This repository is retained only for migration/history.
+
 # ghoten-oras-backend
 
 A standalone Go library for storing Terraform/OpenTofu state as OCI artifacts in container registries using the [ORAS](https://oras.land/) protocol.
